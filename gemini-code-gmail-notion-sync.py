@@ -45,8 +45,8 @@ MY_NAME = "설용환"
 
 TARGET_LABEL_PREFIX = "INBOX/메가존/고객사 문의/"
 
-CREDENTIALS_FILE = r"C:\temp\credentials.json"
-TOKEN_FILE = r"C:\temp\token.json"
+CREDENTIALS_FILE = os.environ.get("GMAIL_CREDENTIALS_FILE", r"C:\temp\credentials.json")
+TOKEN_FILE = os.environ.get("GMAIL_TOKEN_FILE", r"C:\temp\token.json")
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
 
 # ==========================================

@@ -1,0 +1,43 @@
+name: Gmail to Notion Sync
+
+on:
+  schedule:
+    - cron: '0 23 * * *'   # 매일 UTC 23:00 = 한국시간 오전 8시
+  workflow_dispatch:        # Actions 탭에서 수동 실행 버튼도 생김
+
+permissions:
+  contents: write            # sync_progress.json 재커밋용
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore Gmail credentials
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+          echo '${{ secrets.GOOGLE_TOKEN_JSON }}' > token.json
+
+      - name: Run sync
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GMAIL_CREDENTIALS_FILE: ${{ github.workspace }}/credentials.json
+          GMAIL_TOKEN_FILE: ${{ github.workspace }}/token.json
+        run: python gemini-code-gmail-notion-sync.py
+
+      - name: Commit updated progress file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sync_progress.json
+          git diff --staged --quiet || git commit -m "chore: update sync progress [skip ci]"
+          git push

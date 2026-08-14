@@ -3,6 +3,7 @@ import re
 import json
 import base64
 import datetime
+import time
 import traceback
 from email.utils import parseaddr
 
@@ -149,7 +150,7 @@ def norm_loose(text):
 # ==========================================
 # 2-1. 진행 상황 저장/재개 (API 사용량 제한 등으로 중단돼도 이어서 처리)
 # ==========================================
-PROGRESS_FILE = r"C:\temp\sync_progress.json"
+PROGRESS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_progress.json")
 
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
@@ -172,6 +173,28 @@ RATE_LIMIT_MARKERS = ["resource_exhausted", "rate limit", "429", "quota"]
 
 def is_rate_limit_error(e):
     return any(marker in str(e).lower() for marker in RATE_LIMIT_MARKERS)
+
+# 무료 티어 15회/분 한도 대응: 호출 전 최소 간격 확보 + 429 시 자동 대기 재시도
+_last_gemini_call = [0.0]
+GEMINI_MIN_INTERVAL = 4.5  # 초 (15회/분 = 4초 간격, 여유를 둠)
+
+def gemini_generate(prompt, max_retries=5):
+    for attempt in range(max_retries):
+        elapsed = time.time() - _last_gemini_call[0]
+        if elapsed < GEMINI_MIN_INTERVAL:
+            time.sleep(GEMINI_MIN_INTERVAL - elapsed)
+        try:
+            response = ai_client.models.generate_content(model='gemini-3.5-flash-lite', contents=prompt)
+            _last_gemini_call[0] = time.time()
+            return response.text.strip()
+        except Exception as e:
+            _last_gemini_call[0] = time.time()
+            if is_rate_limit_error(e) and attempt < max_retries - 1:
+                wait = 25
+                print(f"      ⏳ API 사용량 제한, {wait}초 대기 후 재시도 ({attempt + 1}/{max_retries})")
+                time.sleep(wait)
+                continue
+            raise
 
 # ==========================================
 # 3. Gmail 인증
@@ -341,11 +364,12 @@ def match_existing_document(subject, recent_docs):
 새로운 별개의 건이면 "NONE" 이라고만 답해. 다른 설명 없이 숫자 또는 NONE만 반환해."""
 
     try:
-        response = ai_client.models.generate_content(model='gemini-3.5-flash-lite', contents=prompt)
-        result = response.text.strip()
+        result = gemini_generate(prompt)
         if result.isdigit() and int(result) < len(recent_docs):
             return recent_docs[int(result)]
     except Exception as e:
+        if is_rate_limit_error(e):
+            raise
         print(f"      ⚠️ 스레드 매칭 AI 오류(새 문서로 처리): {e}")
 
     return None
@@ -364,12 +388,13 @@ def check_incremental_info(existing_content, new_body):
 {{"has_new_info": true 또는 false, "incremental_summary": "새로운 정보만 2~5문장으로 요약 (없으면 빈 문자열)"}}"""
 
     try:
-        response = ai_client.models.generate_content(model='gemini-3.5-flash-lite', contents=prompt)
-        text = response.text.strip()
+        text = gemini_generate(prompt)
         text = re.sub(r"^```json\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         return json.loads(text)
     except Exception as e:
+        if is_rate_limit_error(e):
+            raise
         print(f"      ⚠️ 신규 정보 판별 AI 오류(안전하게 '신규 정보 있음'으로 처리): {e}")
         return {"has_new_info": True, "incremental_summary": new_body[:500] if new_body else ""}
 
@@ -394,9 +419,11 @@ def is_duplicate_item(new_title, new_detail, existing_titles, kind_label):
 새 항목이 위 목록 중 하나와 사실상 같은 내용이면 "DUPLICATE", 새로운 내용이면 "NEW" 라고만 답해. 다른 설명 없이 그 단어만 반환해."""
 
     try:
-        response = ai_client.models.generate_content(model='gemini-3.5-flash-lite', contents=prompt)
-        return response.text.strip().upper().startswith("DUPLICATE")
+        result = gemini_generate(prompt)
+        return result.upper().startswith("DUPLICATE")
     except Exception as e:
+        if is_rate_limit_error(e):
+            raise
         print(f"      ⚠️ {kind_label} 중복 판별 AI 오류(중복 아님으로 간주): {e}")
         return False
 
@@ -446,12 +473,13 @@ def analyze_content_types(subject, body):
     (해당하는 내용이 없으면 빈 리스트 [] 로 반환)
     """
     try:
-        response = ai_client.models.generate_content(model='gemini-3.5-flash-lite', contents=prompt)
-        text = response.text.strip()
+        text = gemini_generate(prompt)
         text = re.sub(r"^```json\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         return json.loads(text)
     except Exception as e:
+        if is_rate_limit_error(e):
+            raise
         print(f"   ⚠️ AI 분석 오류: {e}")
         return {"summary": "", "next_action": "", "type": "메인", "tasks": [], "meetings": [], "memos": []}
 
@@ -786,7 +814,7 @@ def main():
                                             "content": build_full_content(summary, body)})
 
                 for task in ai_data.get("tasks", []):
-                    title = task.get("title", "제목 없음") if isinstance(task, dict) else str(task)
+                    title = f"[{company_name}] " + (task.get("title", "제목 없음") if isinstance(task, dict) else str(task))
                     detail = task.get("detail") if isinstance(task, dict) else None
                     if is_duplicate_item(title, detail, existing_task_titles, "작업"):
                         print(f"      └ ⏭️ [작업 중복 판단, 건너뜀]: {title}")
@@ -797,7 +825,7 @@ def main():
                     print(f"      └ 📌 [작업 생성]: {title}")
 
                 for meeting in ai_data.get("meetings", []):
-                    title = meeting.get("title", "제목 없음") if isinstance(meeting, dict) else str(meeting)
+                    title = f"[{company_name}] " + (meeting.get("title", "제목 없음") if isinstance(meeting, dict) else str(meeting))
                     detail = meeting.get("detail") if isinstance(meeting, dict) else None
                     if is_duplicate_item(title, detail, existing_meeting_titles, "회의"):
                         print(f"      └ ⏭️ [회의 중복 판단, 건너뜀]: {title}")
@@ -808,7 +836,7 @@ def main():
                     print(f"      └ 📅 [회의 생성]: {title}")
 
                 for memo in ai_data.get("memos", []):
-                    title = memo.get("title", "제목 없음") if isinstance(memo, dict) else str(memo)
+                    title = f"[{company_name}] " + (memo.get("title", "제목 없음") if isinstance(memo, dict) else str(memo))
                     detail = memo.get("detail") if isinstance(memo, dict) else None
                     if is_duplicate_item(title, detail, existing_memo_titles, "메모"):
                         print(f"      └ ⏭️ [메모 중복 판단, 건너뜀]: {title}")
